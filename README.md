@@ -1,132 +1,66 @@
-LFS Test Server
-======
+# iNDelible
 
-[rel]: https://github.com/github/lfs-test-server/releases
-[lfs]: https://github.com/github/git-lfs
-[api]: https://github.com/github/git-lfs/tree/master/docs/api#readme
+Minimum viable permanent storage and retrieval over HTTP.
 
-LFS Test Server is an example server that implements the [Git LFS API][api]. It
-is intended to be used for testing the [Git LFS][lfs] client and is not in a
-production ready state.
+## Background
 
-LFS Test Server is written in Go, with pre-compiled binaries available for Mac,
-Windows, Linux, and FreeBSD.
+Forked from [github.com/git-lfs/lfs-test-server](https://github.com/git-lfs/lfs-test-server), so all credit to the [these people](https://github.com/git-lfs/lfs-test-server/graphs/contributors) for doing most of the work.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for info on working on LFS Test Server and
-sending patches.
+The iNDelible server is intended to provide a minimal, HTTP object store with the following specific contraints:
+- Will accept and store any multipart file via HTTP PUT, responding with a unique object ID (initially the SHA256 of the file, but this will probably change) which can then be used to later retrieve the file and/or its metadata.
+- Stored objects are permanent and immutable (hence the name).
+- Must be able to handle large files (>4GB).
 
-## Installing
+ND will implement the storage component of a larger service geared towards Product Information Management (PIM). A fair bit of Googling was done before starting this, but it's as much an opportunity to finally learn golang properly as to end up with a minimal viable storage layer. At the time of writing, there are two projects that look they would do well out of the box:
+- [Perkeep](https://perkeep.org/) (nee Camlistore) which is almost exactly what I want, especially the rsync-style deduping using rolling hash. Appears to use a [Merkle Tree](https://en.wikipedia.org/wiki/Merkle_tree) for the object store?
+- [OpenStack Swift](https://wiki.openstack.org/wiki/Swift) (TODO: morrisjobke/docker-swift-onlyone) which wouldn't just drop in easily, but might be a smart choice because it is designed to scale massively.
 
-Download the [latest version][rel]. It is a single binary file.
+## Details
 
-Alternatively, use the Go installer:
+Implementation-wise, the first cut has the following:
+* Binary storage is pure filesystem, but the plan is to learn more about chunking/deduping as done in rsync, Perkeep, Spideroak etc...
+* Metadata storage uses a [Bolt](https://github.com/boltdb/bolt) key/value DB. Currently we store the FileName (from the client), ContentType, Length (bytes) and the creation date (as a Unix timestamp).
+* Content-Type is inferred from the stream upon storage (using net/http/DetectContentType) because it's way more reliable than listening to what the client thinks.
+* [http://localhost:8080/objects]() will give you a JSON list of hashes
+* [http://localhost:8080/meta/{hash}]() will give you a JSON string of the object's metadata
+* [http://localhost:8080/objects/{hash}]() will return the object itself as a Content-Disposition inline ... so that the file will be rendered by the browser if possible (user friendly for PDFs etc...)
 
-```
-  $ go install github.com/github/lfs-test-server
-```
+## TODO
 
+* Restore lfs-test-server code which used the request's accepts header to allow a single URL to return either the file or its metadata
+* Chunking/deduping binary storage
+* Authentication, not actually a huge priority because no edits or deletions are allowed, but still...
 
-## Building
+## Golang setup
+* Run this:
+  ```bash
+  VERSION=1.10.3
+  OS=linux
+  ARCH=amd64
+  
+  wget https://dl.google.com/go/go$VERSION.$OS-$ARCH.tar.gz
+  tar -C /usr/local -xzf go$VERSION.$OS-$ARCH.tar.gz
+  
+  echo '
+  # Added by golang install
+  export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+  ```
+* Then this, to check it's working:
+  ```bash
+  go --version
+  ```
 
-To build from source, use the Go tools:
-
-```
-  $ go get github.com/github/lfs-test-server
-```
-
-
-## Running
-
-Running the binary will start an LFS server on `localhost:8080` by default.
-There are few things that can be configured via environment variables:
-
-	LFS_LISTEN      # The address:port the server listens on, default: "tcp://:8080"
-	LFS_HOST        # The host used when the server generates URLs, default: "localhost:8080"
-	LFS_METADB      # The database file the server uses to store meta information, default: "lfs.db"
-	LFS_CONTENTPATH # The path where LFS files are store, default: "lfs-content"
-	LFS_ADMINUSER   # An administrator username, default: unset
-	LFS_ADMINPASS   # An administrator password, default: unset
-	LFS_CERT        # Certificate file for tls
-	LFS_KEY         # tls key
-	LFS_SCHEME      # set to 'https' to override default http
-    LFS_USETUS      # set to 'true' to enable tusd (tus.io) resumable upload server; tusd must be on PATH, installed separately
-    LFS_TUSHOST     # The host used to start the tusd upload server, default "localhost:1080"
-
-If the `LFS_ADMINUSER` and `LFS_ADMINPASS` variables are set, a
-rudimentary admin interface can be accessed via
-`http://$LFS_HOST/mgmt`. Here you can add and remove users.
-
-To use the LFS test server with the Git LFS client, configure it in the repository's `.gitconfig` file:
-
-
-```
-  [lfs]
-    url = "http://localhost:8080/"
-
+## Data store
+The default data store is /var/opt/indelible, so you might want to:
+```bash
+sudo mkdir /var/opt/indelible
+sudo chown <user>:<user> /var/opt/indelible
 ```
 
-HTTPS:
+Alternatively, you can override with ENV variables (see config.go).
 
-NOTE: If using https with a self signed cert also disable cert checking in the client repo.
-
-```
-	[lfs]
-		url = "https://localhost:8080/"
-
-	[http]
-		sslverify = false
-
-```
-
-
-An example usage:
-
-
-Generate a key pair
-```
-openssl req -x509 -sha256 -nodes -days 2100 -newkey rsa:2048 -keyout mine.key -out mine.crt
-```
-
-Make yourself a run script
-
-```
-#!/bin/bash
-
-set -eu
-set -o pipefail
-
-
-LFS_LISTEN="tcp://:9999"
-LFS_HOST="127.0.0.1:9999"
-LFS_CONTENTPATH="content"
-LFS_ADMINUSER="<cool admin user name>"
-LFS_ADMINPASS="<better admin password>"
-LFS_CERT="mine.crt"
-LFS_KEY="mine.key"
-LFS_SCHEME="https"
-
-export LFS_LISTEN LFS_HOST LFS_CONTENTPATH LFS_ADMINUSER LFS_ADMINPASS LFS_CERT LFS_KEY LFS_SCHEME
-
-./lfs-test-server
-
-```
-
-Build the server
-
-```
+# Building
+Once you have go installed, build the binary and run it:
+```bash
 go build
-
 ```
-
-Run
-
-```
-bash run.sh
-
-```
-
-Check the managment page
-
-browser: https://localhost:9999/mgmt
-
-

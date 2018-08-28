@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"log"
 	"reflect"
 	"strings"
 )
@@ -11,44 +12,24 @@ import (
 // environment variables, prefixed by keyPrefix. Default values can be added
 // via tags.
 type Configuration struct {
-	Listen      string `config:"tcp://:8080"`
-	Host        string `config:"localhost:8080"`
-	MetaDB      string `config:"lfs.db"`
-	ContentPath string `config:"lfs-content"`
-	AdminUser   string `config:""`
-	AdminPass   string `config:""`
-	Cert        string `config:""`
-	Key         string `config:""`
-	Scheme      string `config:"http"`
-	Public      string `config:"public"`
-	UseTus      string `config:"false"`
-	TusHost     string `config:"localhost:1080"`
+	Listen		string `config:"tcp://:8080"`
+	Host		string `config:"localhost:8080"`
+	DataPath	string `config:"/var/opt/ndel/"`
+	AdminUser	string `config:""`
+	AdminPass	string `config:""`
+	Cert		string `config:""`
+	Key		string `config:""`
+	Proto		string `config:"http"`
 }
 
 func (c *Configuration) IsHTTPS() bool {
-	return strings.Contains(Config.Scheme, "https")
-}
-
-func (c *Configuration) IsPublic() bool {
-	switch Config.Public {
-	case "1", "true", "TRUE":
-		return true
-	}
-	return false
-}
-
-func (c *Configuration) IsUsingTus() bool {
-	switch Config.UseTus {
-	case "1", "true", "TRUE":
-		return true
-	}
-	return false
+	return strings.Contains(Config.Proto, "https")
 }
 
 // Config is the global app configuration
 var Config = &Configuration{}
 
-const keyPrefix = "LFS"
+const keyPrefix = "NDEL"
 
 func init() {
 	te := reflect.TypeOf(Config).Elem()
@@ -62,7 +43,15 @@ func init() {
 		envVar := strings.ToUpper(fmt.Sprintf("%s_%s", keyPrefix, name))
 		env := os.Getenv(envVar)
 		tag := sf.Tag.Get("config")
-
+		
+		if env != "" {
+			log.Printf("CONFIG:%s: %s set to %s from env", envVar, name, env)
+		} else if tag != "" {
+			log.Printf("CONFIG:%s: %s set to %s from tag", envVar, name, tag)
+		} else {
+			log.Printf("CONFIG:%s: %s not set", envVar, name)
+		}
+		
 		if env == "" && tag != "" {
 			env = tag
 		}

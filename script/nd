@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import requests
+import hashlib
+from functools import partial
+import json
+from pygments import highlight, lexers, formatters
+
+import urllib3
+urllib3.disable_warnings()
+
+remote = os.getenv("ND_REMOTE", default="http://127.0.0.1")
+
+def json_pprint(d):
+	j = json.dumps(d, sort_keys=True, indent=2, separators=(',', ': '))
+	colorful_json = highlight(j, lexers.JsonLexer(), formatters.TerminalFormatter())
+	print(colorful_json)
+
+def sha256(filename):
+    with open(filename, mode='rb') as f:
+        d = hashlib.sha256()
+        for buf in iter(partial(f.read, 128), b''):
+            d.update(buf)
+    return d.hexdigest()
+
+parser = argparse.ArgumentParser(
+	prog="nd",
+	description="iNDdelible command line client tool"
+)
+subparsers = parser.add_subparsers(
+	dest='action',
+	help='Action',
+)
+
+list_parser = subparsers.add_parser('l', help='List all files')
+
+meta_parser = subparsers.add_parser('m', help='Get object metadata')
+meta_parser.add_argument(
+	'oid',
+	help="Object ID to fetch metadata about",
+)
+
+put_parser = subparsers.add_parser('p', help='Put a file')
+put_parser.add_argument(
+	'--url',
+	help="When set, will attempt fetch the source file from a URL before putting onto the server",
+	action='store_true'
+)
+put_parser.add_argument(
+	'--rename',
+	help="Optional switch for provide a new filename to use when uploading",
+	type=str
+)
+put_parser.add_argument(
+	'file',
+	help="File to put on the server",
+)
+a = parser.parse_args()
+
+if a.action == None:
+	parser.print_help()
+	exit(1)
+
+if (a.action == 'p'):
+	if a.url:	
+		r = requests.get(a.file, allow_redirects=True)
+		ct = r.headers.get('content-type')
+		if 'html' in ct.lower():
+			print("ERROR: URL doesn't seem to point to a downloadable file")
+			exit(1)
+		print(ct)
+		print(os.path.basename(a.file))
+		filename = os.path.basename(a.file)
+		filepath = '/tmp/{}'.format(filename)
+		open(filepath, 'wb').write(r.content)
+	else:
+		filepath = os.path.normpath(a.file)
+		filename = os.path.basename(filepath)
+	
+	if a.rename != None:
+		filename = a.rename
+		print("Renaming upload to {}".format(filename))
+	
+	hash = sha256(filepath)
+	url = '{}/objects/{}'.format(remote, hash)
+	files = {'file': (filename, open(filepath, 'rb'))}
+	print(url)
+	rt = requests.put(url, files=files, verify=False)
+	r = json.loads(rt.text)
+	json_pprint(r)
+	exit(0)
+
+if (a.action == 'l'):
+	url = '{}/objects'.format(remote)
+	rt = requests.get(url, verify=False)
+	r = json.loads(rt.text)
+	result = {}
+	for h in r['objects']:
+		url = '{}/meta/{}'.format(remote,h)
+		rt = requests.get(url, verify=False)
+		m = json.loads(rt.text)
+		result[h] = m['meta']['filename']
+	json_pprint(result)
+	exit(0)
+
+if (a.action == 'm'):
+	url = '{}/meta/{}'.format(remote, a.oid)
+	rt = requests.get(url, verify=False)
+	r = json.loads(rt.text)
+	del r['status']
+	r['url'] = '{}/objects/{}'.format(remote, a.oid)
+	json_pprint(r)
+	exit(0)

@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	contentMediaType = "application/vnd.git-lfs"
+	contentMediaType = "application/vnd.ndel"
 	metaMediaType    = contentMediaType + "+json"
-	version          = "0.4.0"
+	version          = "0.0.2"
 )
 
 var (
@@ -60,7 +60,9 @@ func wrapHttps(l net.Listener, cert, key string) (net.Listener, error) {
 }
 
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == "-v" {
+	if len(os.Args) == 2 && (
+		os.Args[1] == "--version" ||
+		os.Args[1] == "-v") {
 		fmt.Println(version)
 		os.Exit(0)
 	}
@@ -82,12 +84,12 @@ func main() {
 		}
 	}
 
-	metaStore, err := NewMetaStore(Config.MetaDB)
+	metaStore, err := NewBoltMetaStore(Config.DataPath + "meta.db")
 	if err != nil {
 		logger.Fatal(kv{"fn": "main", "err": "Could not open the meta store: " + err.Error()})
 	}
 
-	contentStore, err := NewContentStore(Config.ContentPath)
+	contentStore, err := NewFsObjectStore(Config.DataPath + "objects")
 	if err != nil {
 		logger.Fatal(kv{"fn": "main", "err": "Could not open the content store: " + err.Error()})
 	}
@@ -107,12 +109,6 @@ func main() {
 	logger.Log(kv{"fn": "main", "msg": "listening", "pid": os.Getpid(), "addr": Config.Listen, "version": version})
 
 	app := NewApp(contentStore, metaStore)
-	if Config.IsUsingTus() {
-		tusServer.Start()
-	}
 	app.Serve(listener)
 	tl.WaitForChildren()
-	if Config.IsUsingTus() {
-		tusServer.Stop()
-	}
 }

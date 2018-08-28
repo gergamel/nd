@@ -7,207 +7,70 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
-	"strconv"
+	"errors"
 	"strings"
+	"bytes"
 	"time"
+	"log"
 
 	"github.com/gorilla/context"
 	"github.com/gorilla/mux"
 )
 
-// RequestVars contain variables from the HTTP request. Variables from routing, json body decoding, and
-// some headers are stored.
-type RequestVars struct {
-	Oid      string
-	Size     int64
-	User     string
-	Password string
-	Repo     string
-	Authorization string
+type ObjectStore interface {
+	List() ([]string, error)
+	Exists(hash string) bool
+	Get(hash string, fromByte int64) (io.ReadCloser, error)
+	Put(hash string, f io.Reader) (int64, error)
+	DetectContentType(hash string) string
 }
 
-type BatchVars struct {
-	Transfers []string       `json:"transfers,omitempty"`
-	Operation string         `json:"operation"`
-	Objects   []*RequestVars `json:"objects"`
+type MetaData struct {
+	FileName	string	`json:"filename"`
+	ContentType	string	`json:"content-type"`
+	Length		int64	`json:"size"`
+	Created		int64	`json:"created"`
 }
 
-// MetaObject is object metadata as seen by the object and metadata stores.
-type MetaObject struct {
-	Oid      string `json:"oid"`
-	Size     int64  `json:"size"`
-	Existing bool
+type ResponseData struct {
+	code	int
+	Status	string		`json:"status"`
+	Oid	string		`json:"oid,omitempty"`
+	Meta	*MetaData	`json:"meta,omitempty"`
 }
 
-type BatchResponse struct {
-	Transfer string            `json:"transfer,omitempty"`
-	Objects  []*Representation `json:"objects"`
+type MetaStore interface {
+	Get(hash string) (*MetaData, error)
+	Put(hash string, d *MetaData) error
 }
 
-// Representation is object medata as seen by clients of the lfs server.
-type Representation struct {
-	Oid     string           `json:"oid"`
-	Size    int64            `json:"size"`
-	Actions map[string]*link `json:"actions"`
-	Error   *ObjectError     `json:"error,omitempty"`
-}
-
-type ObjectError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-type User struct {
-	Name string `json:"name"`
-}
-
-type Lock struct {
-	Id       string    `json:"id"`
-	Path     string    `json:"path"`
-	Owner    User      `json:"owner"`
-	LockedAt time.Time `json:"locked_at"`
-}
-
-type LockRequest struct {
-	Path string `json:"path"`
-}
-
-type LockResponse struct {
-	Lock    *Lock  `json:"lock"`
-	Message string `json:"message,omitempty"`
-}
-
-type UnlockRequest struct {
-	Force bool `json:"force"`
-}
-
-type UnlockResponse struct {
-	Lock    *Lock  `json:"lock"`
-	Message string `json:"message,omitempty"`
-}
-
-type LockList struct {
-	Locks      []Lock `json:"locks"`
-	NextCursor string `json:"next_cursor,omitempty"`
-	Message    string `json:"message,omitempty"`
-}
-
-type VerifiableLockRequest struct {
-	Cursor string `json:"cursor,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
-}
-
-type VerifiableLockList struct {
-	Ours       []Lock `json:"ours"`
-	Theirs     []Lock `json:"theirs"`
-	NextCursor string `json:"next_cursor,omitempty"`
-	Message    string `json:"message,omitempty"`
-}
-
-// DownloadLink builds a URL to download the object.
-func (v *RequestVars) DownloadLink() string {
-	return v.internalLink("objects")
-}
-
-// UploadLink builds a URL to upload the object.
-func (v *RequestVars) UploadLink(useTus bool) string {
-	if useTus {
-		return v.tusLink()
-	}
-	return v.internalLink("objects")
-}
-
-func (v *RequestVars) internalLink(subpath string) string {
-	path := ""
-
-	if len(v.User) > 0 {
-		path += fmt.Sprintf("/%s", v.User)
-	}
-
-	if len(v.Repo) > 0 {
-		path += fmt.Sprintf("/%s", v.Repo)
-	}
-
-	path += fmt.Sprintf("/%s/%s", subpath, v.Oid)
-
-	if Config.IsHTTPS() {
-		return fmt.Sprintf("%s://%s%s", Config.Scheme, Config.Host, path)
-	}
-
-	return fmt.Sprintf("http://%s%s", Config.Host, path)
-}
-
-func (v *RequestVars) tusLink() string {
-	link, err := tusServer.Create(v.Oid, v.Size)
-	if err != nil {
-		logger.Fatal(kv{"fn": fmt.Sprintf("Unable to create tus link for %s: %v", v.Oid, err)})
-	}
-	return link
-}
-
-func (v *RequestVars) VerifyLink() string {
-	path := fmt.Sprintf("/verify/%s", v.Oid)
-
-	if Config.IsHTTPS() {
-		return fmt.Sprintf("%s://%s%s", Config.Scheme, Config.Host, path)
-	}
-
-	return fmt.Sprintf("http://%s%s", Config.Host, path)
-}
-
-// link provides a structure used to build a hypermedia representation of an HTTP link.
-type link struct {
-	Href      string            `json:"href"`
-	Header    map[string]string `json:"header,omitempty"`
-	ExpiresAt time.Time         `json:"expires_at,omitempty"`
-}
-
-// App links a Router, ContentStore, and MetaStore to provide the LFS server.
+// App links a Router, ObjectStore, and MetaStore to provide the LFS server.
 type App struct {
-	router       *mux.Router
-	contentStore *ContentStore
-	metaStore    *MetaStore
+	router		*mux.Router
+	objectStore	ObjectStore
+	metaStore	MetaStore
 }
 
-// NewApp creates a new App using the ContentStore and MetaStore provided
-func NewApp(content *ContentStore, meta *MetaStore) *App {
-	app := &App{contentStore: content, metaStore: meta}
-
+func NewApp(st ObjectStore, mst MetaStore) *App {
+	app := &App{objectStore: st, metaStore: mst}
 	r := mux.NewRouter()
-
-	r.HandleFunc("/{user}/{repo}/objects/batch", app.requireAuth(app.BatchHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-
-	route := "/{user}/{repo}/objects/{oid}"
-	r.HandleFunc(route, app.requireAuth(app.GetContentHandler)).Methods("GET", "HEAD").MatcherFunc(ContentMatcher)
-	r.HandleFunc(route, app.requireAuth(app.GetMetaHandler)).Methods("GET", "HEAD").MatcherFunc(MetaMatcher)
-	r.HandleFunc(route, app.requireAuth(app.PutHandler)).Methods("PUT").MatcherFunc(ContentMatcher)
-
-	r.HandleFunc("/{user}/{repo}/objects", app.requireAuth(app.PostHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-
-	r.HandleFunc("/{user}/{repo}/locks", app.requireAuth(app.LocksHandler)).Methods("GET").MatcherFunc(MetaMatcher)
-	r.HandleFunc("/{user}/{repo}/locks/verify", app.requireAuth(app.LocksVerifyHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-	r.HandleFunc("/{user}/{repo}/locks", app.requireAuth(app.CreateLockHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-	r.HandleFunc("/{user}/{repo}/locks/{id}/unlock", app.requireAuth(app.DeleteLockHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-
-	r.HandleFunc("/objects/batch", app.requireAuth(app.BatchHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-
-	route = "/objects/{oid}"
-	r.HandleFunc(route, app.requireAuth(app.GetContentHandler)).Methods("GET", "HEAD").MatcherFunc(ContentMatcher)
-	r.HandleFunc(route, app.requireAuth(app.GetMetaHandler)).Methods("GET", "HEAD").MatcherFunc(MetaMatcher)
-	r.HandleFunc(route, app.requireAuth(app.PutHandler)).Methods("PUT").MatcherFunc(ContentMatcher)
-
-	r.HandleFunc("/objects", app.requireAuth(app.PostHandler)).Methods("POST").MatcherFunc(MetaMatcher)
-
-	r.HandleFunc("/verify/{oid}", app.VerifyHandler).Methods("POST")
-
-	app.addMgmt(r)
-
+	
+	r.HandleFunc("/", app.RootHandler).Methods("GET")
+	
+	r.HandleFunc("/objects", app.DirHandler).Methods("GET")
+	r.HandleFunc("/objects/", app.DirHandler).Methods("GET")
+	
+	r.HandleFunc("/meta/{hash}", app.GetMetaHandler).Methods("GET")//.MatcherFunc(MetaMatcher)
+	
+	r.HandleFunc("/objects/{hash}", app.GetHandler).Methods("GET", "HEAD")
+	r.HandleFunc("/objects/{hash}", app.PutHandler).Methods("PUT")//.MatcherFunc(ContentMatcher)
+	
 	app.router = r
 
 	return app
 }
 
+// App implements ServeHTTP so it is an http.Handler
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
@@ -223,16 +86,65 @@ func (a *App) Serve(l net.Listener) error {
 	return http.Serve(l, a)
 }
 
-// GetContentHandler gets the content from the content store
-func (a *App) GetContentHandler(w http.ResponseWriter, r *http.Request) {
-	rv := unpack(r)
-	meta, err := a.metaStore.Get(rv)
-	if err != nil {
-		writeStatus(w, r, 404)
+func writeResponseData(w http.ResponseWriter, r *http.Request, d ResponseData) {
+	w.Header().Set("Content-Type", metaMediaType)
+	w.WriteHeader(d.code)
+	enc := json.NewEncoder(w)
+	enc.Encode(d)
+}
+
+func writeError(w http.ResponseWriter, r *http.Request, code int, e error) {
+	d := ResponseData{code: code, Status: e.Error(), Meta: nil}
+	writeResponseData(w, r, d)
+}
+
+func (a *App) RootHandler(w http.ResponseWriter, r *http.Request) {
+	d := ResponseData{code: 200, Status: "OK", Meta: nil}
+	writeResponseData(w, r, d)
+}
+
+func (a *App) DirHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", metaMediaType)
+	w.WriteHeader(200)
+	objs, err := a.objectStore.List()
+	if ((err != nil) || (len(objs) == 0)) {
+		fmt.Fprintf(w, `{"objects":[]}`)
+		log.Printf("Return empty list: %s\n", err)
 		return
 	}
+	
+	fmt.Fprint(w, "{\"objects\": ")
+	d := '['
+	for _, h := range objs {
+		fmt.Fprintf(w, "%c\"%s\"", d, h)
+		d = ','
+	}
+	fmt.Fprint(w, "]}")
+	log.Printf("Return list of hashes\n")
+}
 
-	// Support resume download using Range header
+func (a *App) GetMetaHandler(w http.ResponseWriter, r *http.Request) {
+	mv := mux.Vars(r)
+	oid := mv["hash"]
+	meta,err := a.metaStore.Get(oid)
+	if err != nil {
+		writeError(w, r, 404, err)
+		return
+	}
+	log.Printf("Content-Disposition: attachment; filename=%s", meta.FileName)
+	log.Printf("Content-Type: %s", meta.ContentType)
+	log.Printf("Content-Length: %d", meta.Length)
+
+	d := ResponseData{code: 200, Status: "OK", Oid: oid, Meta: meta}
+	writeResponseData(w, r, d)
+}
+
+func (a *App) GetHandler(w http.ResponseWriter, r *http.Request) {
+	mv := mux.Vars(r)
+	oid := mv["hash"]
+	log.Printf("GetHandler() object %s\n", oid)
+	
+	/* TODO: Support resume download using Range header
 	var fromByte int64
 	statusCode := 200
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
@@ -244,346 +156,101 @@ func (a *App) GetContentHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", fromByte, meta.Size-1, int64(meta.Size)-fromByte))
 		}
 	}
+	content, err := a.contentStore.Get(meta, fromByte)*/
 
-	content, err := a.contentStore.Get(meta, fromByte)
+	meta,err := a.metaStore.Get(oid)
 	if err != nil {
-		writeStatus(w, r, 404)
+		writeError(w, r, 404, err)
+		return
+	}
+	log.Printf("Content-Disposition: attachment; filename=%s", meta.FileName)
+	log.Printf("Content-Type: %s", meta.ContentType)
+	log.Printf("Content-Length: %d", meta.Length)
+	
+	content, err := a.objectStore.Get(oid, 0)
+	if err != nil {
+		writeError(w, r, 404, err)
 		return
 	}
 	defer content.Close()
-
-	w.WriteHeader(statusCode)
+	
+	/* Also need to properly pass the accept content-type header in the request */
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%s", meta.FileName))
+	w.Header().Set("Content-Type", meta.ContentType)
+	w.WriteHeader(200)
 	io.Copy(w, content)
-	logRequest(r, statusCode)
 }
 
-// GetMetaHandler retrieves metadata about the object
-func (a *App) GetMetaHandler(w http.ResponseWriter, r *http.Request) {
-	rv := unpack(r)
-	meta, err := a.metaStore.Get(rv)
-	if err != nil {
-		writeStatus(w, r, 404)
+func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("================================================================================\n")
+	mv := mux.Vars(r)
+	oid := mv["hash"]
+	log.Printf("PUT object %s\n", oid)
+	if a.objectStore.Exists(oid) {
+		writeError(w, r, 409, errors.New("Exists"))
+		log.Print("Rejected: Already exists\n")
 		return
 	}
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	if r.Method == "GET" {
-		enc := json.NewEncoder(w)
-		enc.Encode(a.Represent(rv, meta, true, false, false))
-	}
-
-	logRequest(r, 200)
-}
-
-// PostHandler instructs the client how to upload data
-func (a *App) PostHandler(w http.ResponseWriter, r *http.Request) {
-	rv := unpack(r)
-	meta, err := a.metaStore.Put(rv)
+	
+	// Set up for Multipart streaming read
+	reader, err := r.MultipartReader()
 	if err != nil {
-		writeStatus(w, r, 404)
+		writeError(w, r, 500, err)
+		log.Printf("Failed: %s\n", err)
 		return
 	}
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	sentStatus := 202
-	if meta.Existing && a.contentStore.Exists(meta) {
-		sentStatus = 200
-	}
-	w.WriteHeader(sentStatus)
-
-	enc := json.NewEncoder(w)
-	enc.Encode(a.Represent(rv, meta, meta.Existing, true, false))
-	logRequest(r, sentStatus)
-}
-
-// BatchHandler provides the batch api
-func (a *App) BatchHandler(w http.ResponseWriter, r *http.Request) {
-	bv := unpackBatch(r)
-
-	var responseObjects []*Representation
-
-	var useTus bool
-	if bv.Operation == "upload" && Config.IsUsingTus() {
-		for _, t := range bv.Transfers {
-			if t == "tus" {
-				useTus = true
-				break
+	
+	meta := MetaData{FileName: "", ContentType: "", Length: 0}
+	ct := "application/octet-stream"
+	
+	// Iterate through the parts
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		log.Printf("FormName: %s\n", part.FormName())
+		log.Printf("FileName: %s\n", part.FileName())
+		meta.FileName = part.FileName()
+		for key, value := range part.Header {
+			log.Printf("%s: %s\n", key, value[0])
+			if (key == "Content-Type") {
+				ct = value[0]
 			}
 		}
-	}
-
-	// Create a response object
-	for _, object := range bv.Objects {
-		meta, err := a.metaStore.Get(object)
-		if err == nil && a.contentStore.Exists(meta) { // Object is found and exists
-			responseObjects = append(responseObjects, a.Represent(object, meta, true, false, false))
+		
+		// if part.FileName() is empty, decode the value
+		if part.FileName() == "" {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(part)
+			log.Printf("Value: %s\n", buf.String())
 			continue
 		}
-
-		// Object is not found
-		meta, err = a.metaStore.Put(object)
-		if err == nil {
-			responseObjects = append(responseObjects, a.Represent(object, meta, meta.Existing, true, useTus))
+		
+		// Otherwise, part is a file, try to put it into the store
+		written, err := a.objectStore.Put(oid, part)
+		if err != nil {
+			writeError(w, r, 500, err)
+			log.Printf("Failed: %s\n", err)
+			return
 		}
-	}
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	respobj := &BatchResponse{Objects: responseObjects}
-	// Respond with TUS support if advertised
-	if useTus {
-		respobj.Transfer = "tus"
-	}
-
-	enc := json.NewEncoder(w)
-	enc.Encode(respobj)
-	logRequest(r, 200)
-}
-
-// PutHandler receives data from the client and puts it into the content store
-func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
-	rv := unpack(r)
-	meta, err := a.metaStore.Get(rv)
-	if err != nil {
-		writeStatus(w, r, 404)
-		return
-	}
-
-	if err := a.contentStore.Put(meta, r.Body); err != nil {
-		a.metaStore.Delete(rv)
-		w.WriteHeader(500)
-		fmt.Fprintf(w, `{"message":"%s"}`, err)
-		return
-	}
-
-	logRequest(r, 200)
-}
-
-func (a *App) VerifyHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	oid := vars["oid"]
-	err := tusServer.Finish(oid, a.contentStore)
-
-	if err != nil {
-		logger.Fatal(kv{"fn": "VerifyHandler", "err": fmt.Sprintf("Failed to verify %s: %v", oid, err)})
-	}
-
-	logRequest(r, 200)
-}
-
-func (a *App) LocksHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	repo := vars["repo"]
-
-	enc := json.NewEncoder(w)
-	ll := &LockList{}
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	locks, nextCursor, err := a.metaStore.FilteredLocks(repo,
-		r.FormValue("path"),
-		r.FormValue("cursor"),
-		r.FormValue("limit"))
-
-	if err != nil {
-		ll.Message = err.Error()
-	} else {
-		ll.Locks = locks
-		ll.NextCursor = nextCursor
-	}
-
-	enc.Encode(ll)
-
-	logRequest(r, 200)
-}
-
-func (a *App) LocksVerifyHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	repo := vars["repo"]
-	user := context.Get(r, "USER")
-
-	dec := json.NewDecoder(r.Body)
-	enc := json.NewEncoder(w)
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	reqBody := &VerifiableLockRequest{}
-	if err := dec.Decode(reqBody); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		enc.Encode(&VerifiableLockList{Message: err.Error()})
-		return
-	}
-	
-	// Limit is optional
-	limit := reqBody.Limit
-	if limit == 0 {
-		limit = 100
-	}
-
-	ll := &VerifiableLockList{}
-	locks, nextCursor, err := a.metaStore.FilteredLocks(repo, "",
-		reqBody.Cursor,
-		strconv.Itoa(limit))
-	if err != nil {
-		ll.Message = err.Error()
-	} else {
-		ll.NextCursor = nextCursor
-
-		for _, l := range locks {
-			if l.Owner.Name == user {
-				ll.Ours = append(ll.Ours, l)
-			} else {
-				ll.Theirs = append(ll.Theirs, l)
-			}
+		meta.Length = written
+		meta.ContentType = a.objectStore.DetectContentType(oid)
+		if (ct != meta.ContentType) {
+			log.Printf("Detected Content-Type: %s", meta.ContentType)
 		}
-	}
-
-	enc.Encode(ll)
-
-	logRequest(r, 200)
-}
-
-func (a *App) CreateLockHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	repo := vars["repo"]
-	user := context.Get(r, "USER").(string)
-
-	dec := json.NewDecoder(r.Body)
-	enc := json.NewEncoder(w)
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	var lockRequest LockRequest
-	if err := dec.Decode(&lockRequest); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		enc.Encode(&LockResponse{Message: err.Error()})
-		return
-	}
-
-	locks, _, err := a.metaStore.FilteredLocks(repo, lockRequest.Path, "", "1")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		enc.Encode(&LockResponse{Message: err.Error()})
-		return
-	}
-	if len(locks) > 0 {
-		w.WriteHeader(http.StatusConflict)
-		enc.Encode(&LockResponse{Message: "lock already created"})
-		return
-	}
-
-	lock := &Lock{
-		Id:       randomLockId(),
-		Path:     lockRequest.Path,
-		Owner:    User{Name: user},
-		LockedAt: time.Now(),
-	}
-
-	if err := a.metaStore.AddLocks(repo, *lock); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		enc.Encode(&LockResponse{Message: err.Error()})
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	enc.Encode(&LockResponse{
-		Lock: lock,
-	})
-
-	logRequest(r, 200)
-}
-
-func (a *App) DeleteLockHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	repo := vars["repo"]
-	lockId := vars["id"]
-	user := context.Get(r, "USER").(string)
-
-	dec := json.NewDecoder(r.Body)
-	enc := json.NewEncoder(w)
-
-	w.Header().Set("Content-Type", metaMediaType)
-
-	var unlockRequest UnlockRequest
-
-	if len(lockId) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		enc.Encode(&UnlockResponse{Message: "invalid lock id"})
-		return
-	}
-
-	if err := dec.Decode(&unlockRequest); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		enc.Encode(&UnlockResponse{Message: err.Error()})
-		return
-	}
-
-	l, err := a.metaStore.DeleteLock(repo, user, lockId, unlockRequest.Force)
-	if err != nil {
-		if err == errNotOwner {
-			w.WriteHeader(http.StatusForbidden)
-		} else {
-			w.WriteHeader(http.StatusInternalServerError)
+		meta.Created = time.Now().Unix()
+		err = a.metaStore.Put(oid, &meta)
+		if err != nil {
+			writeError(w, r, 500, err)
+			log.Printf("Failed: %s\n", err)
+			return
 		}
-		enc.Encode(&UnlockResponse{Message: err.Error()})
+		d := ResponseData{code: 201, Status: "OK", Oid: oid, Meta: &meta}
+		writeResponseData(w, r, d)
 		return
 	}
-	if l == nil {
-		w.WriteHeader(http.StatusNotFound)
-		enc.Encode(&UnlockResponse{Message: "unable to find lock"})
-		return
-	}
-
-	enc.Encode(&UnlockResponse{Lock: l})
-
-	logRequest(r, 200)
-}
-
-// Represent takes a RequestVars and Meta and turns it into a Representation suitable
-// for json encoding
-func (a *App) Represent(rv *RequestVars, meta *MetaObject, download, upload, useTus bool) *Representation {
-	rep := &Representation{
-		Oid:     meta.Oid,
-		Size:    meta.Size,
-		Actions: make(map[string]*link),
-	}
-
-	header := make(map[string]string)
-	header["Accept"] = contentMediaType
-	
-	if len(rv.Authorization) > 0 {
-		header["Authorization"] = rv.Authorization
-	}
-	
-	if download {
-		rep.Actions["download"] = &link{Href: rv.DownloadLink(), Header: header}
-	}
-
-	if upload {
-		rep.Actions["upload"] = &link{Href: rv.UploadLink(useTus), Header: header}
-		if useTus {
-			rep.Actions["verify"] = &link{Href: rv.VerifyLink(), Header: header}
-		}
-	}
-	return rep
-}
-
-func (a *App) requireAuth(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !Config.IsPublic() {
-			user, password, _ := r.BasicAuth()
-			if user, ret := a.metaStore.Authenticate(user, password); !ret {
-				w.Header().Set("WWW-Authenticate", "Basic realm=git-lfs-server")
-				writeStatus(w, r, 401)
-				return
-			} else {
-				context.Set(r, "USER", user)
-			}
-		}
-		h(w, r)
-	}
+	writeError(w, r, 400, errors.New("No file parts found in request"))
 }
 
 // ContentMatcher provides a mux.MatcherFunc that only allows requests that contain
@@ -600,71 +267,6 @@ func MetaMatcher(r *http.Request, m *mux.RouteMatch) bool {
 	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
 	mt := mediaParts[0]
 	return mt == metaMediaType
-}
-
-func randomLockId() string {
-	var id [20]byte
-	rand.Read(id[:])
-	return fmt.Sprintf("%x", id[:])
-}
-
-func unpack(r *http.Request) *RequestVars {
-	vars := mux.Vars(r)
-	rv := &RequestVars{
-		User: vars["user"],
-		Repo: vars["repo"],
-		Oid:  vars["oid"],
-		Authorization: r.Header.Get("Authorization"),
-	}
-
-	if r.Method == "POST" { // Maybe also check if +json
-		var p RequestVars
-		dec := json.NewDecoder(r.Body)
-		err := dec.Decode(&p)
-		if err != nil {
-			return rv
-		}
-
-		rv.Oid = p.Oid
-		rv.Size = p.Size
-	}
-
-	return rv
-}
-
-// TODO cheap hack, unify with unpack
-func unpackBatch(r *http.Request) *BatchVars {
-	vars := mux.Vars(r)
-
-	var bv BatchVars
-
-	dec := json.NewDecoder(r.Body)
-	err := dec.Decode(&bv)
-	if err != nil {
-		return &bv
-	}
-
-	for i := 0; i < len(bv.Objects); i++ {
-		bv.Objects[i].User = vars["user"]
-		bv.Objects[i].Repo = vars["repo"]
-		bv.Objects[i].Authorization = r.Header.Get("Authorization")
-	}
-
-	return &bv
-}
-
-func writeStatus(w http.ResponseWriter, r *http.Request, status int) {
-	message := http.StatusText(status)
-
-	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
-	mt := mediaParts[0]
-	if strings.HasSuffix(mt, "+json") {
-		message = `{"message":"` + message + `"}`
-	}
-
-	w.WriteHeader(status)
-	fmt.Fprint(w, message)
-	logRequest(r, status)
 }
 
 func logRequest(r *http.Request, status int) {
