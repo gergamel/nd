@@ -21,13 +21,13 @@ Implementation-wise, the first cut has the following:
 * Binary storage is pure filesystem, but the plan is to learn more about chunking/deduping as done in rsync, Perkeep, Spideroak etc...
 * Metadata storage uses a [Bolt](https://github.com/boltdb/bolt) key/value DB. Currently we store the FileName (from the client), ContentType, Length (bytes) and the creation date (as a Unix timestamp).
 * Content-Type is inferred from the stream upon storage (using net/http/DetectContentType) because it's way more reliable than listening to what the client thinks.
-* [http://localhost:8080/objects]() will give you a JSON list of hashes
-* [http://localhost:8080/meta/{hash}]() will give you a JSON string of the object's metadata
-* [http://localhost:8080/objects/{hash}]() will return the object itself as a Content-Disposition inline ... so that the file will be rendered by the browser if possible (user friendly for PDFs etc...)
+* GET [http://localhost:8080/objects]() will give you a JSON list of oids.
+* GET [http://localhost:8080/objects/{oid}]() Will return metadata for the given OID, if "Accept: application/vnd.nd+json". With all other "Accept" header settings, will return the object itself as a Content-Disposition inline so that the file will be rendered by a browser if possible (e.g. Image/PDF).
+* PUT [http://localhost:8080/objects/{oid}]() Will store the object on the server, responding with the metadata for the stored object.
+* With the exception of GET [http://localhost:8080/objects/{oid}](), ALL requests must have "Accept: application/vnd.nd+json" or they will fail with 404 Not Found.
 
 ## TODO
 
-* Restore lfs-test-server code which used the request's accepts header to allow a single URL to return either the file or its metadata
 * Chunking/deduping binary storage
 * Authentication, not actually a huge priority because no edits or deletions are allowed, but still...
 

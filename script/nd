@@ -11,7 +11,10 @@ from pygments import highlight, lexers, formatters
 import urllib3
 urllib3.disable_warnings()
 
-remote = os.getenv("ND_REMOTE", default="http://127.0.0.1")
+remote = os.getenv("ND_REMOTE", default="http://127.0.0.1:8080")
+ct_object = "application/vnd.nd"
+ct_meta = "application/vnd.nd+json"
+#text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8
 
 def json_pprint(d):
 	j = json.dumps(d, sort_keys=True, indent=2, separators=(',', ': '))
@@ -19,11 +22,11 @@ def json_pprint(d):
 	print(colorful_json)
 
 def sha256(filename):
-    with open(filename, mode='rb') as f:
-        d = hashlib.sha256()
-        for buf in iter(partial(f.read, 128), b''):
-            d.update(buf)
-    return d.hexdigest()
+	with open(filename, mode='rb') as f:
+		d = hashlib.sha256()
+		for buf in iter(partial(f.read, 128), b''):
+			d.update(buf)
+	return d.hexdigest()
 
 parser = argparse.ArgumentParser(
 	prog="nd",
@@ -64,7 +67,7 @@ if a.action == None:
 	exit(1)
 
 if (a.action == 'p'):
-	if a.url:	
+	if a.url:
 		r = requests.get(a.file, allow_redirects=True)
 		ct = r.headers.get('content-type')
 		if 'html' in ct.lower():
@@ -87,29 +90,31 @@ if (a.action == 'p'):
 	url = '{}/objects/{}'.format(remote, hash)
 	files = {'file': (filename, open(filepath, 'rb'))}
 	print(url)
-	rt = requests.put(url, files=files, verify=False)
+	rt = requests.put(url, files=files, verify=False, headers={'Accept': ct_meta})
+	print(rt.text)
 	r = json.loads(rt.text)
 	json_pprint(r)
 	exit(0)
 
 if (a.action == 'l'):
 	url = '{}/objects'.format(remote)
-	rt = requests.get(url, verify=False)
+	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
 	r = json.loads(rt.text)
+	json_pprint(r)
+	'''
 	result = {}
 	for h in r['objects']:
-		url = '{}/meta/{}'.format(remote,h)
-		rt = requests.get(url, verify=False)
+		url = '{}/objects/{}'.format(remote,h)
+		rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
 		m = json.loads(rt.text)
-		result[h] = m['meta']['filename']
+		result[h] = m['meta']
 	json_pprint(result)
+	'''
 	exit(0)
 
 if (a.action == 'm'):
-	url = '{}/meta/{}'.format(remote, a.oid)
-	rt = requests.get(url, verify=False)
-	r = json.loads(rt.text)
-	del r['status']
-	r['url'] = '{}/objects/{}'.format(remote, a.oid)
-	json_pprint(r)
+	url = '{}/objects/{}'.format(remote, a.oid)
+	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
+	m = json.loads(rt.text)
+	json_pprint(m['meta'])
 	exit(0)

@@ -29,7 +29,7 @@ func (c *Configuration) IsHTTPS() bool {
 // Config is the global app configuration
 var Config = &Configuration{}
 
-const keyPrefix = "NDEL"
+const keyPrefix = "ND"
 
 func init() {
 	te := reflect.TypeOf(Config).Elem()

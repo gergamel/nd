@@ -18,7 +18,6 @@ type BoltMetaStore struct {
 var (
 	errNoBucket       = errors.New("Bucket not found")
 	errObjectNotFound = errors.New("Object not found")
-	errNotOwner       = errors.New("Attempt to delete other user's lock")
 	objectsBucket = []byte("objects")
 )
 
@@ -38,7 +37,7 @@ func NewBoltMetaStore(dbFile string) (*BoltMetaStore, error) {
 	return &BoltMetaStore{db: db}, nil
 }
 
-func (s *BoltMetaStore) Get(hash string) (*MetaData, error) {
+func (s *BoltMetaStore) Get(oid string) (*MetaData, error) {
 	var d MetaData
 	
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -47,7 +46,7 @@ func (s *BoltMetaStore) Get(hash string) (*MetaData, error) {
 			return errNoBucket
 		}
 		
-		value := bucket.Get([]byte(hash))
+		value := bucket.Get([]byte(oid))
 		if len(value) == 0 {
 			return errObjectNotFound
 		}
@@ -63,10 +62,10 @@ func (s *BoltMetaStore) Get(hash string) (*MetaData, error) {
 	return &d, nil
 }
 
-// Put writes meta information to the store, keyed by the object hash.
-func (s *BoltMetaStore) Put(hash string, d *MetaData) error {	// Check if it exists first
+// Put writes meta information to the store, keyed by the object oid.
+func (s *BoltMetaStore) Put(oid string, d *MetaData) error {	// Check if it exists first
 	// Check if it exists first
-	if _, err := s.Get(hash); err == nil {
+	if _, err := s.Get(oid); err == nil {
 		return nil
 	}
 	
@@ -83,7 +82,7 @@ func (s *BoltMetaStore) Put(hash string, d *MetaData) error {	// Check if it exi
 			return errNoBucket
 		}
 		
-		err = bucket.Put([]byte(hash), buf.Bytes())
+		err = bucket.Put([]byte(oid), buf.Bytes())
 		if err != nil {
 			return err
 		}
@@ -103,28 +102,21 @@ func (s *BoltMetaStore) Close() {
 	s.db.Close()
 }
 
-// Objects returns all MetaObjects in the meta store
-func (s *BoltMetaStore) Objects() ([]*MetaData, error) {
-	var objects []*MetaData
-
+// Objects returns all OID keys in the meta store
+func (s *BoltMetaStore) Keys() ([]string, error) {
+	var keys []string
+	
 	err := s.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(objectsBucket)
 		if bucket == nil {
 			return errNoBucket
 		}
-
 		bucket.ForEach(func(k, v []byte) error {
-			var meta MetaData
-			dec := gob.NewDecoder(bytes.NewBuffer(v))
-			err := dec.Decode(&meta)
-			if err != nil {
-				return err
-			}
-			objects = append(objects, &meta)
+			keys = append(keys, string(k))
 			return nil
 		})
 		return nil
 	})
-
-	return objects, err
+	
+	return keys, err
 }

@@ -19,10 +19,10 @@ import (
 
 type ObjectStore interface {
 	List() ([]string, error)
-	Exists(hash string) bool
-	Get(hash string, fromByte int64) (io.ReadCloser, error)
-	Put(hash string, f io.Reader) (int64, error)
-	DetectContentType(hash string) string
+	Exists(oid string) bool
+	Get(oid string, fromByte int64) (io.ReadCloser, error)
+	Put(oid string, f io.Reader) (int64, error)
+	DetectContentType(oid string) string
 }
 
 type MetaData struct {
@@ -40,8 +40,9 @@ type ResponseData struct {
 }
 
 type MetaStore interface {
-	Get(hash string) (*MetaData, error)
-	Put(hash string, d *MetaData) error
+	Get(oid string) (*MetaData, error)
+	Put(oid string, d *MetaData) error
+	Keys() ([]string, error)
 }
 
 // App links a Router, ObjectStore, and MetaStore to provide the LFS server.
@@ -55,15 +56,13 @@ func NewApp(st ObjectStore, mst MetaStore) *App {
 	app := &App{objectStore: st, metaStore: mst}
 	r := mux.NewRouter()
 	
-	r.HandleFunc("/", app.RootHandler).Methods("GET")
+	r.HandleFunc("/", app.RootHandler).Methods("GET").MatcherFunc(AcceptsMeta)
 	
-	r.HandleFunc("/objects", app.DirHandler).Methods("GET")
-	r.HandleFunc("/objects/", app.DirHandler).Methods("GET")
+	r.HandleFunc("/objects", app.DirHandler).Methods("GET").MatcherFunc(AcceptsMeta)
 	
-	r.HandleFunc("/meta/{hash}", app.GetMetaHandler).Methods("GET")//.MatcherFunc(MetaMatcher)
-	
-	r.HandleFunc("/objects/{hash}", app.GetHandler).Methods("GET", "HEAD")
-	r.HandleFunc("/objects/{hash}", app.PutHandler).Methods("PUT")//.MatcherFunc(ContentMatcher)
+	r.HandleFunc("/objects/{oid}", app.PutHandler).Methods("PUT").MatcherFunc(AcceptsMeta)
+	r.HandleFunc("/objects/{oid}", app.GetHandler).Methods("GET", "HEAD").MatcherFunc(AcceptsNotMeta)
+	r.HandleFunc("/objects/{oid}", app.GetMetaHandler).Methods("GET").MatcherFunc(AcceptsMeta)
 	
 	app.router = r
 
@@ -77,8 +76,38 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		context.Set(r, "RequestID", fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]))
 	}
-
 	a.router.ServeHTTP(w, r)
+}
+
+func logRequest(r *http.Request, status int) {
+	logger.Log(kv{"method": r.Method, "url": r.URL, "status": status, "request_id": context.Get(r, "RequestID")})
+}
+
+// AcceptsContent provides a mux.MatcherFunc that only allows requests that contain
+// an Accept header with the contentMediaType
+func AcceptsContent(r *http.Request, m *mux.RouteMatch) bool {
+	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
+	mt := mediaParts[0]
+	return mt == contentMediaType
+}
+
+// AcceptsMeta provides a mux.MatcherFunc that only allows requests that contain
+// an Accept header with the metaMediaType
+func AcceptsMeta(r *http.Request, m *mux.RouteMatch) bool {
+	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
+	mt := mediaParts[0]
+	return mt == metaMediaType
+}
+
+// AcceptsNotMeta is only used by the /objects/{oid} route to ensure opening an
+// object URL in a browser will return the file object for rendering inline, where
+// this is possible (e.g. PDF).
+// TODO: Could maybe change this to mediaParts[0]=="text/html", but need to try
+//       out different browsers...
+func AcceptsNotMeta(r *http.Request, m *mux.RouteMatch) bool {
+	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
+	mt := mediaParts[0]
+	return mt != metaMediaType
 }
 
 // Serve calls http.Serve with the provided Listener and the app's router
@@ -86,63 +115,68 @@ func (a *App) Serve(l net.Listener) error {
 	return http.Serve(l, a)
 }
 
-func writeResponseData(w http.ResponseWriter, r *http.Request, d ResponseData) {
+func writeResponseData(w http.ResponseWriter, r *http.Request, d *ResponseData) {
+	logRequest(r,d.code)
 	w.Header().Set("Content-Type", metaMediaType)
 	w.WriteHeader(d.code)
 	enc := json.NewEncoder(w)
-	enc.Encode(d)
+	enc.Encode(*d)
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, code int, e error) {
-	d := ResponseData{code: code, Status: e.Error(), Meta: nil}
+	d := &ResponseData{code: code, Status: e.Error(), Meta: nil}
 	writeResponseData(w, r, d)
 }
 
 func (a *App) RootHandler(w http.ResponseWriter, r *http.Request) {
-	d := ResponseData{code: 200, Status: "OK", Meta: nil}
+	d := &ResponseData{code: 200, Status: "OK", Meta: nil}
 	writeResponseData(w, r, d)
 }
 
 func (a *App) DirHandler(w http.ResponseWriter, r *http.Request) {
+	logRequest(r,200)
 	w.Header().Set("Content-Type", metaMediaType)
 	w.WriteHeader(200)
+	/*
 	objs, err := a.objectStore.List()
-	if ((err != nil) || (len(objs) == 0)) {
+	*/
+	keys, err := a.metaStore.Keys()
+	if ((err != nil) || (len(keys) == 0)) {
 		fmt.Fprintf(w, `{"objects":[]}`)
-		log.Printf("Return empty list: %s\n", err)
 		return
 	}
 	
 	fmt.Fprint(w, "{\"objects\": ")
 	d := '['
-	for _, h := range objs {
+	for _, h := range keys {
 		fmt.Fprintf(w, "%c\"%s\"", d, h)
 		d = ','
 	}
 	fmt.Fprint(w, "]}")
-	log.Printf("Return list of hashes\n")
+}
+
+func (a *App) BuildMetaResponse(oid string) (*ResponseData, error) {
+	meta,err := a.metaStore.Get(oid)
+	if err != nil {
+		return nil, err
+	}
+	return &ResponseData{code: 200, Status: "OK", Oid: oid, Meta: meta}, nil
 }
 
 func (a *App) GetMetaHandler(w http.ResponseWriter, r *http.Request) {
 	mv := mux.Vars(r)
-	oid := mv["hash"]
-	meta,err := a.metaStore.Get(oid)
+	oid := mv["oid"]
+	d,err := a.BuildMetaResponse(oid)
 	if err != nil {
 		writeError(w, r, 404, err)
 		return
 	}
-	log.Printf("Content-Disposition: attachment; filename=%s", meta.FileName)
-	log.Printf("Content-Type: %s", meta.ContentType)
-	log.Printf("Content-Length: %d", meta.Length)
-
-	d := ResponseData{code: 200, Status: "OK", Oid: oid, Meta: meta}
 	writeResponseData(w, r, d)
 }
 
 func (a *App) GetHandler(w http.ResponseWriter, r *http.Request) {
 	mv := mux.Vars(r)
-	oid := mv["hash"]
-	log.Printf("GetHandler() object %s\n", oid)
+	oid := mv["oid"]
 	
 	/* TODO: Support resume download using Range header
 	var fromByte int64
@@ -163,10 +197,6 @@ func (a *App) GetHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 404, err)
 		return
 	}
-	log.Printf("Content-Disposition: attachment; filename=%s", meta.FileName)
-	log.Printf("Content-Type: %s", meta.ContentType)
-	log.Printf("Content-Length: %d", meta.Length)
-	
 	content, err := a.objectStore.Get(oid, 0)
 	if err != nil {
 		writeError(w, r, 404, err)
@@ -175,6 +205,7 @@ func (a *App) GetHandler(w http.ResponseWriter, r *http.Request) {
 	defer content.Close()
 	
 	/* Also need to properly pass the accept content-type header in the request */
+	logRequest(r,200)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%s", meta.FileName))
 	w.Header().Set("Content-Type", meta.ContentType)
 	w.WriteHeader(200)
@@ -182,13 +213,16 @@ func (a *App) GetHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("================================================================================\n")
 	mv := mux.Vars(r)
-	oid := mv["hash"]
-	log.Printf("PUT object %s\n", oid)
+	oid := mv["oid"]
 	if a.objectStore.Exists(oid) {
-		writeError(w, r, 409, errors.New("Exists"))
-		log.Print("Rejected: Already exists\n")
+		d,err := a.BuildMetaResponse(oid)
+		if err != nil {
+			writeError(w, r, 500, err)
+			return
+		}
+		d.Status = "Already Exists"
+		writeResponseData(w, r, d)
 		return
 	}
 	
@@ -196,12 +230,10 @@ func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
 	reader, err := r.MultipartReader()
 	if err != nil {
 		writeError(w, r, 500, err)
-		log.Printf("Failed: %s\n", err)
 		return
 	}
 	
 	meta := MetaData{FileName: "", ContentType: "", Length: 0}
-	ct := "application/octet-stream"
 	
 	// Iterate through the parts
 	for {
@@ -214,9 +246,6 @@ func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
 		meta.FileName = part.FileName()
 		for key, value := range part.Header {
 			log.Printf("%s: %s\n", key, value[0])
-			if (key == "Content-Type") {
-				ct = value[0]
-			}
 		}
 		
 		// if part.FileName() is empty, decode the value
@@ -231,44 +260,20 @@ func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
 		written, err := a.objectStore.Put(oid, part)
 		if err != nil {
 			writeError(w, r, 500, err)
-			log.Printf("Failed: %s\n", err)
 			return
 		}
 		meta.Length = written
 		meta.ContentType = a.objectStore.DetectContentType(oid)
-		if (ct != meta.ContentType) {
-			log.Printf("Detected Content-Type: %s", meta.ContentType)
-		}
+		log.Printf("Detected Content-Type: %s", meta.ContentType)
 		meta.Created = time.Now().Unix()
 		err = a.metaStore.Put(oid, &meta)
 		if err != nil {
 			writeError(w, r, 500, err)
-			log.Printf("Failed: %s\n", err)
 			return
 		}
-		d := ResponseData{code: 201, Status: "OK", Oid: oid, Meta: &meta}
+		d := &ResponseData{code: 201, Status: "Created", Oid: oid, Meta: &meta}
 		writeResponseData(w, r, d)
 		return
 	}
 	writeError(w, r, 400, errors.New("No file parts found in request"))
-}
-
-// ContentMatcher provides a mux.MatcherFunc that only allows requests that contain
-// an Accept header with the contentMediaType
-func ContentMatcher(r *http.Request, m *mux.RouteMatch) bool {
-	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
-	mt := mediaParts[0]
-	return mt == contentMediaType
-}
-
-// MetaMatcher provides a mux.MatcherFunc that only allows requests that contain
-// an Accept header with the metaMediaType
-func MetaMatcher(r *http.Request, m *mux.RouteMatch) bool {
-	mediaParts := strings.Split(r.Header.Get("Accept"), ";")
-	mt := mediaParts[0]
-	return mt == metaMediaType
-}
-
-func logRequest(r *http.Request, status int) {
-	logger.Log(kv{"method": r.Method, "url": r.URL, "status": status, "request_id": context.Get(r, "RequestID")})
 }
