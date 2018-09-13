@@ -37,22 +37,27 @@ subparsers = parser.add_subparsers(
 	help='Action',
 )
 
-list_parser = subparsers.add_parser('l', help='List all files')
-
-meta_parser = subparsers.add_parser('m', help='Get object metadata')
-meta_parser.add_argument(
-	'oid',
-	help="Object ID to fetch metadata about",
+list_parser = subparsers.add_parser('list', aliases=['l'], help='List all files')
+list_parser.add_argument(
+	'-v', '--verbose',
+	action='store_true',
+	help="Runs meta query on every object to provide all metadata for all objects",
 )
 
-put_parser = subparsers.add_parser('p', help='Put a file')
+meta_parser = subparsers.add_parser('meta', aliases=['m'], help='Get object metadata')
+meta_parser.add_argument(
+	'oid',
+	help="Object ID to fetch metadata for",
+)
+
+put_parser = subparsers.add_parser('put', aliases=['p'], help='Put a file')
 put_parser.add_argument(
-	'--url',
+	'-v', '--url',
 	help="When set, will attempt fetch the source file from a URL before putting onto the server",
 	action='store_true'
 )
 put_parser.add_argument(
-	'--rename',
+	'-r', '--rename',
 	help="Optional switch for provide a new filename to use when uploading",
 	type=str
 )
@@ -100,8 +105,10 @@ if (a.action == 'l'):
 	url = '{}/objects'.format(remote)
 	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
 	r = json.loads(rt.text)
-	json_pprint(r)
-	'''
+	if not a.verbose:
+		json_pprint(r)
+		exit(0)
+	
 	result = {}
 	for h in r['objects']:
 		url = '{}/objects/{}'.format(remote,h)
@@ -109,7 +116,6 @@ if (a.action == 'l'):
 		m = json.loads(rt.text)
 		result[h] = m['meta']
 	json_pprint(result)
-	'''
 	exit(0)
 
 if (a.action == 'm'):
