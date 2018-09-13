@@ -28,6 +28,32 @@ def sha256(filename):
 			d.update(buf)
 	return d.hexdigest()
 
+def nd_get_meta(oid):
+	url = '{}/objects/{}'.format(remote,oid)
+	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
+	m = json.loads(rt.text)
+	return m['meta']
+
+def nd_list(verbose=False):
+	url = '{}/objects'.format(remote)
+	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
+	r = json.loads(rt.text)
+	if not verbose:
+		return r
+	
+	result = {}
+	for h in r['objects']:
+		result[h] = nd_get_meta(h)
+	return result
+
+def nd_find_filename(filename):
+	result = []
+	rows = nd_list(True)
+	for oid, m in rows.items():
+		if filename in m['filename']:
+			result.append({oid: m})
+	return result
+
 parser = argparse.ArgumentParser(
 	prog="nd",
 	description="iNDdelible command line client tool"
@@ -46,13 +72,24 @@ list_parser.add_argument(
 
 meta_parser = subparsers.add_parser('meta', aliases=['m'], help='Get object metadata')
 meta_parser.add_argument(
+	'-f', '--filename',
+	action='store_true',
+	help="Optional switch to search on filename rather than oid",
+)
+meta_parser.add_argument(
 	'oid',
-	help="Object ID to fetch metadata for",
+	help="Object ID or filename to fetch metadata for",
+)
+
+get_parser = subparsers.add_parser('get', aliases=['g'], help='Get object')
+get_parser.add_argument(
+	'oid',
+	help="Object ID to fetch",
 )
 
 put_parser = subparsers.add_parser('put', aliases=['p'], help='Put a file')
 put_parser.add_argument(
-	'-v', '--url',
+	'-u', '--url',
 	help="When set, will attempt fetch the source file from a URL before putting onto the server",
 	action='store_true'
 )
@@ -73,12 +110,13 @@ if a.action == None:
 
 if (a.action == 'p'):
 	if a.url:
+		print("getting " + a.file)
 		r = requests.get(a.file, allow_redirects=True)
 		ct = r.headers.get('content-type')
-		if 'html' in ct.lower():
-			print("ERROR: URL doesn't seem to point to a downloadable file")
-			exit(1)
-		print(ct)
+		if ct != None:
+			if 'html' in ct.lower():
+				print("ERROR: URL doesn't seem to point to a downloadable file")
+				exit(1)
 		print(os.path.basename(a.file))
 		filename = os.path.basename(a.file)
 		filepath = '/tmp/{}'.format(filename)
@@ -102,25 +140,33 @@ if (a.action == 'p'):
 	exit(0)
 
 if (a.action == 'l'):
-	url = '{}/objects'.format(remote)
-	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
-	r = json.loads(rt.text)
-	if not a.verbose:
-		json_pprint(r)
-		exit(0)
-	
-	result = {}
-	for h in r['objects']:
-		url = '{}/objects/{}'.format(remote,h)
-		rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
-		m = json.loads(rt.text)
-		result[h] = m['meta']
+	result = nd_list(a.verbose)
 	json_pprint(result)
 	exit(0)
 
 if (a.action == 'm'):
+	if a.filename == False:
+		url = '{}/objects/{}'.format(remote, a.oid)
+		rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
+		m = json.loads(rt.text)
+		json_pprint(m['meta'])
+		exit(0)
+	
+	results = nd_find_filename(a.oid)
+	if len(results) == 0:
+		print("Not found")
+		exit(1)
+	json_pprint(results)
+	exit(0)
+
+if (a.action == 'g'):
+	m = nd_get_meta(a.oid)
+	
+	cwd = os.getcwd()
+	filepath = '{}/{}'.format(cwd, m['filename'])
+	print(filepath)
+	
 	url = '{}/objects/{}'.format(remote, a.oid)
-	rt = requests.get(url, verify=False, headers={'Accept': ct_meta})
-	m = json.loads(rt.text)
-	json_pprint(m['meta'])
+	r = requests.get(url, verify=False, headers={'Accept': "*/*"})
+	open(filepath, 'wb').write(r.content)
 	exit(0)
