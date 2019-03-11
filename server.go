@@ -1,17 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
-	"errors"
 	"strings"
-	"bytes"
 	"time"
-	"log"
 
 	"github.com/gorilla/context"
 	"github.com/gorilla/mux"
@@ -141,7 +142,7 @@ func (a *App) DirHandler(w http.ResponseWriter, r *http.Request) {
 	objs, err := a.objectStore.List()
 	*/
 	keys, err := a.metaStore.Keys()
-	if ((err != nil) || (len(keys) == 0)) {
+	if (err != nil) || (len(keys) == 0) {
 		fmt.Fprintf(w, `{"objects":[]}`)
 		return
 	}
@@ -216,7 +217,8 @@ func (a *App) PutHandler(w http.ResponseWriter, r *http.Request) {
 	mv := mux.Vars(r)
 	oid := mv["oid"]
 	if a.objectStore.Exists(oid) {
-		d,err := a.BuildMetaResponse(oid)
+		io.Copy(ioutil.Discard, r.Body) // Consume the file data and throw away
+		d, err := a.BuildMetaResponse(oid)
 		if err != nil {
 			writeError(w, r, 500, err)
 			return
